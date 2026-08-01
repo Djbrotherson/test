@@ -1,0 +1,100 @@
+name: Build Lighthouse for H700
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-h700:
+    name: Native ARM64 Cortex-A53 build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+
+    steps:
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git cmake ninja-build pkg-config python3 \
+            libsdl2-dev libpng-dev libsdl2-net-dev libzip-dev \
+            zipcmp zipmerge ziptool nlohmann-json3-dev \
+            libtinyxml2-dev libspdlog-dev libboost-dev \
+            libopengl-dev libgl-dev libglew-dev libglfw3-dev \
+            libogg-dev libvorbis-dev llvm binutils
+
+      - name: Fetch exact Lighthouse 1.0.1 source and submodules
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --recurse-submodules https://github.com/HarbourMasters/Lighthouse.git source
+          cd source
+          git checkout 4423e0c1a10e70c42301bce2a5fb969964cf3537
+          git submodule sync --recursive
+          git submodule update --init --recursive --force
+          git status --short
+          git submodule status --recursive
+
+      - name: Configure Cortex-A53 build
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd source
+          cmake -S . -B build-h700 -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS_RELEASE="-O2 -DNDEBUG -march=armv8-a -mcpu=cortex-a53 -mtune=cortex-a53 -mno-outline-atomics" \
+            -DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG -march=armv8-a -mcpu=cortex-a53 -mtune=cortex-a53 -mno-outline-atomics" \
+            -DCMAKE_EXE_LINKER_FLAGS="-Wl,--as-needed"
+
+      - name: Build Lighthouse
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake --build source/build-h700 --parallel "$(nproc)"
+          test -x source/build-h700/Lighthouse
+          file source/build-h700/Lighthouse
+
+      - name: Check executable architecture and instruction set
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BIN=source/build-h700/Lighthouse
+          file "$BIN" | grep -q 'ARM aarch64'
+          readelf -h "$BIN"
+          llvm-objdump -d --no-show-raw-insn "$BIN" > lighthouse-disassembly.txt
+
+          # These instructions require ARM revisions/extensions beyond the
+          # Cortex-A53's ARMv8.0 baseline when emitted as ordinary code.
+          if grep -Eiq '[[:space:]](udot|sdot|ldapr[bhd]?|ldapur[bhsw]?|stlur[bhsw]?|cas(al|a|l)?[bh]?|swp(al|a|l)?[bh]?|ldadd(al|a|l)?[bh]?)[[:space:]]' lighthouse-disassembly.txt; then
+            echo 'ERROR: Post-ARMv8.0 instruction detected:'
+            grep -Einm 50 '[[:space:]](udot|sdot|ldapr[bhd]?|ldapur[bhsw]?|stlur[bhsw]?|cas(al|a|l)?[bh]?|swp(al|a|l)?[bh]?|ldadd(al|a|l)?[bh]?)[[:space:]]' lighthouse-disassembly.txt
+            exit 1
+          fi
+
+      - name: Package replacement file
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p package/lighthouse
+          install -m 755 source/build-h700/Lighthouse package/lighthouse/Lighthouse
+          cat > package/INSTALL.txt <<'EOF'
+          LIGHTHOUSE H700 / muOS INSTALLATION
+
+          1. Copy the "lighthouse" folder over your existing Lighthouse port folder.
+          2. Allow it to replace the existing file named "Lighthouse".
+          3. Keep your existing Lighthouse.sh, lighthouse.gptk, assets and game data.
+          4. Launch Lighthouse normally from muOS.
+          EOF
+          cd package
+          zip -9 -r ../Lighthouse-H700-muOS.zip lighthouse INSTALL.txt
+
+      - name: Upload completed H700 package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lighthouse-H700-muOS
+          path: Lighthouse-H700-muOS.zip
+          if-no-files-found: error
+          retention-days: 30
