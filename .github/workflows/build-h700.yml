@@ -1,4 +1,4 @@
-name: Build Lighthouse for H700
+name: Build Lighthouse for H700 (muOS-compatible)
 
 on:
   workflow_dispatch:
@@ -7,68 +7,78 @@ permissions:
   contents: read
 
 jobs:
-  build-h700:
-    name: Native ARM64 Cortex-A53 build
+  build:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
-      - name: Install build dependencies
+      - name: Build inside Debian Bullseye ARM64
         shell: bash
         run: |
           set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential git cmake ninja-build pkg-config python3 \
-            libsdl2-dev libpng-dev libsdl2-net-dev libzip-dev \
-            zipcmp zipmerge ziptool nlohmann-json3-dev \
-            libtinyxml2-dev libspdlog-dev libboost-dev \
-            libopengl-dev libgl-dev libglew-dev libglfw3-dev \
-            libogg-dev libvorbis-dev llvm binutils
+          mkdir -p "$GITHUB_WORKSPACE/out"
 
-      - name: Fetch exact Lighthouse 1.0.1 source and submodules
-        shell: bash
-        run: |
-          set -euxo pipefail
-          git clone --recurse-submodules https://github.com/HarbourMasters/Lighthouse.git source
-          cd source
-          git checkout 4423e0c1a10e70c42301bce2a5fb969964cf3537
-          git submodule sync --recursive
-          git submodule update --init --recursive --force
-          git submodule status --recursive
+          docker run --rm \
+            --platform linux/arm64 \
+            -v "$GITHUB_WORKSPACE/out:/out" \
+            debian:bullseye \
+            bash -lc '
+              set -euxo pipefail
+              export DEBIAN_FRONTEND=noninteractive
 
-      - name: Configure Cortex-A53 build
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd source
-          cmake -S . -B build-h700 -GNinja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_FLAGS_RELEASE="-O2 -DNDEBUG -march=armv8-a -mcpu=cortex-a53 -mtune=cortex-a53 -mno-outline-atomics" \
-            -DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG -march=armv8-a -mcpu=cortex-a53 -mtune=cortex-a53 -mno-outline-atomics" \
-            -DCMAKE_EXE_LINKER_FLAGS="-Wl,--as-needed"
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential git cmake ninja-build pkg-config python3 ca-certificates \
+                libsdl2-dev libsdl2-net-dev libpng-dev libzip-dev \
+                libtinyxml2-dev libspdlog-dev libfmt-dev \
+                libboost-dev libglvnd-dev libopengl-dev libgl-dev \
+                libglew-dev libglfw3-dev libogg-dev libvorbis-dev \
+                nlohmann-json3-dev patchelf zip file binutils
 
-      - name: Build Lighthouse
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cmake --build source/build-h700 --parallel "$(nproc)"
-          test -x source/build-h700/Lighthouse
-          file source/build-h700/Lighthouse
+              git clone --recurse-submodules https://github.com/HarbourMasters/Lighthouse.git /src
+              cd /src
+              git checkout 4423e0c1a10e70c42301bce2a5fb969964cf3537
+              git submodule sync --recursive
+              git submodule update --init --recursive --force
 
-      - name: Package replacement file
-        shell: bash
-        run: |
-          set -euxo pipefail
-          mkdir -p package/lighthouse
-          install -m 755 source/build-h700/Lighthouse package/lighthouse/Lighthouse
-          cd package
-          zip -9 -r ../Lighthouse-H700-muOS.zip lighthouse
+              cmake -S . -B build-h700 -GNinja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_FLAGS_RELEASE="-O2 -DNDEBUG -march=armv8-a -mcpu=cortex-a53 -mtune=cortex-a53 -mno-outline-atomics" \
+                -DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG -march=armv8-a -mcpu=cortex-a53 -mtune=cortex-a53 -mno-outline-atomics" \
+                -DCMAKE_EXE_LINKER_FLAGS="-Wl,--as-needed"
 
-      - name: Upload completed H700 package
+              cmake --build build-h700 --parallel "$(nproc)"
+              test -x build-h700/Lighthouse
+
+              mkdir -p /package/lighthouse/libs
+              install -m 755 build-h700/Lighthouse /package/lighthouse/Lighthouse
+
+              # Bundle non-glibc runtime libraries, including libOpenGL.so.0.
+              ldd build-h700/Lighthouse | awk '\''/=> \\// { print $3 } /^\\// { print $1 }'\'' | sort -u > /tmp/libs.txt
+              while IFS= read -r lib; do
+                case "$(basename "$lib")" in
+                  libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|librt.so.*|ld-linux-aarch64.so.*)
+                    ;;
+                  *)
+                    cp -L "$lib" /package/lighthouse/libs/
+                    ;;
+                esac
+              done < /tmp/libs.txt
+
+              patchelf --set-rpath '\''$ORIGIN/libs'\'' /package/lighthouse/Lighthouse
+
+              file /package/lighthouse/Lighthouse
+              readelf --version-info /package/lighthouse/Lighthouse | grep -o "GLIBC_[0-9.]*" | sort -Vu | tail || true
+              test -f /package/lighthouse/libs/libOpenGL.so.0
+
+              cd /package
+              zip -9 -r /out/Lighthouse-H700-muOS-compatible.zip lighthouse
+            '
+
+      - name: Upload completed port files
         uses: actions/upload-artifact@v4
         with:
-          name: Lighthouse-H700-muOS
-          path: Lighthouse-H700-muOS.zip
+          name: Lighthouse-H700-muOS-compatible
+          path: out/Lighthouse-H700-muOS-compatible.zip
           if-no-files-found: error
           retention-days: 30
