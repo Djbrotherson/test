@@ -1,4 +1,4 @@
-name: Build Lighthouse for H700 (muOS-compatible)
+name: Build Lighthouse H700 v2
 
 on:
   workflow_dispatch:
@@ -9,76 +9,103 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
+    container:
+      image: debian:bullseye
     timeout-minutes: 120
 
     steps:
-      - name: Build inside Debian Bullseye ARM64
+      - name: Install build tools
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/out"
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential git cmake ninja-build pkg-config python3 ca-certificates \
+            libsdl2-dev libsdl2-net-dev libpng-dev libzip-dev \
+            libtinyxml2-dev libspdlog-dev libfmt-dev libboost-dev \
+            libglvnd-dev libgl-dev libglew-dev libglfw3-dev \
+            libogg-dev libvorbis-dev nlohmann-json3-dev \
+            patchelf zip file binutils
 
-          docker run --rm \
-            --platform linux/arm64 \
-            -v "$GITHUB_WORKSPACE/out:/out" \
-            debian:bullseye \
-            bash -lc '
-              set -euxo pipefail
-              export DEBIAN_FRONTEND=noninteractive
+      - name: Download exact Lighthouse source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone https://github.com/HarbourMasters/Lighthouse.git source
+          cd source
+          git checkout 4423e0c1a10e70c42301bce2a5fb969964cf3537
+          git submodule sync --recursive
+          git submodule update --init --recursive --force
+          git submodule status --recursive
 
-              apt-get update
-              apt-get install -y --no-install-recommends \
-                build-essential git cmake ninja-build pkg-config python3 ca-certificates \
-                libsdl2-dev libsdl2-net-dev libpng-dev libzip-dev \
-                libtinyxml2-dev libspdlog-dev libfmt-dev \
-                libboost-dev libglvnd-dev libopengl-dev libgl-dev \
-                libglew-dev libglfw3-dev libogg-dev libvorbis-dev \
-                nlohmann-json3-dev patchelf zip file binutils
+      - name: Configure for Cortex-A53
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S source -B source/build-h700 -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-O2 -march=armv8-a -mcpu=cortex-a53 -mtune=cortex-a53 -mno-outline-atomics" \
+            -DCMAKE_CXX_FLAGS="-O2 -march=armv8-a -mcpu=cortex-a53 -mtune=cortex-a53 -mno-outline-atomics" \
+            -DCMAKE_EXE_LINKER_FLAGS="-Wl,--as-needed"
 
-              git clone --recurse-submodules https://github.com/HarbourMasters/Lighthouse.git /src
-              cd /src
-              git checkout 4423e0c1a10e70c42301bce2a5fb969964cf3537
-              git submodule sync --recursive
-              git submodule update --init --recursive --force
+      - name: Compile
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake --build source/build-h700 --parallel "$(nproc)" 2>&1 | tee build.log
+          test -x source/build-h700/Lighthouse
+          file source/build-h700/Lighthouse | tee -a build.log
 
-              cmake -S . -B build-h700 -GNinja \
-                -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_C_FLAGS_RELEASE="-O2 -DNDEBUG -march=armv8-a -mcpu=cortex-a53 -mtune=cortex-a53 -mno-outline-atomics" \
-                -DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG -march=armv8-a -mcpu=cortex-a53 -mtune=cortex-a53 -mno-outline-atomics" \
-                -DCMAKE_EXE_LINKER_FLAGS="-Wl,--as-needed"
+      - name: Package muOS runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p package/lighthouse/libs
+          install -m 755 source/build-h700/Lighthouse package/lighthouse/Lighthouse
 
-              cmake --build build-h700 --parallel "$(nproc)"
-              test -x build-h700/Lighthouse
+          ldd source/build-h700/Lighthouse | awk '/=> \/+/ {print $3} /^\// {print $1}' | sort -u > runtime-libraries.txt
+          cat runtime-libraries.txt
 
-              mkdir -p /package/lighthouse/libs
-              install -m 755 build-h700/Lighthouse /package/lighthouse/Lighthouse
+          while IFS= read -r lib; do
+            [ -n "$lib" ] || continue
+            case "$(basename "$lib")" in
+              libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|librt.so.*|ld-linux-aarch64.so.*)
+                ;;
+              *)
+                cp -L "$lib" package/lighthouse/libs/
+                ;;
+            esac
+          done < runtime-libraries.txt
 
-              # Bundle non-glibc runtime libraries, including libOpenGL.so.0.
-              ldd build-h700/Lighthouse | awk '\''/=> \\// { print $3 } /^\\// { print $1 }'\'' | sort -u > /tmp/libs.txt
-              while IFS= read -r lib; do
-                case "$(basename "$lib")" in
-                  libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|librt.so.*|ld-linux-aarch64.so.*)
-                    ;;
-                  *)
-                    cp -L "$lib" /package/lighthouse/libs/
-                    ;;
-                esac
-              done < /tmp/libs.txt
+          patchelf --set-rpath '$ORIGIN/libs' package/lighthouse/Lighthouse
+          test -f package/lighthouse/libs/libOpenGL.so.0
 
-              patchelf --set-rpath '\''$ORIGIN/libs'\'' /package/lighthouse/Lighthouse
+          readelf --version-info package/lighthouse/Lighthouse > elf-versions.txt
+          readelf -d package/lighthouse/Lighthouse > elf-dynamic.txt
+          find package -maxdepth 3 -type f -printf '%p\n' | sort > package-files.txt
 
-              file /package/lighthouse/Lighthouse
-              readelf --version-info /package/lighthouse/Lighthouse | grep -o "GLIBC_[0-9.]*" | sort -Vu | tail || true
-              test -f /package/lighthouse/libs/libOpenGL.so.0
+          cd package
+          zip -9 -r ../Lighthouse-H700-muOS.zip lighthouse
 
-              cd /package
-              zip -9 -r /out/Lighthouse-H700-muOS-compatible.zip lighthouse
-            '
-
-      - name: Upload completed port files
+      - name: Upload finished port files
         uses: actions/upload-artifact@v4
         with:
-          name: Lighthouse-H700-muOS-compatible
-          path: out/Lighthouse-H700-muOS-compatible.zip
+          name: Lighthouse-H700-muOS-v2
+          path: Lighthouse-H700-muOS.zip
           if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload diagnostic files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lighthouse-H700-build-diagnostics
+          path: |
+            build.log
+            runtime-libraries.txt
+            elf-versions.txt
+            elf-dynamic.txt
+            package-files.txt
+          if-no-files-found: warn
           retention-days: 30
