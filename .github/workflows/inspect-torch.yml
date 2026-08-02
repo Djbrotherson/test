@@ -1,0 +1,70 @@
+name: Inspect Lighthouse Torch source
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+
+    steps:
+      - name: Download exact Lighthouse source
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git clone https://github.com/HarbourMasters/Lighthouse.git source
+          cd source
+          git checkout 4423e0c1a10e70c42301bce2a5fb969964cf3537
+          git submodule sync --recursive
+          git submodule update --init --recursive --force
+          git submodule status --recursive | tee ../submodules.txt
+
+      - name: Collect Torch formatter source files
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p torch-source/factories/sm64/behavior
+          mkdir -p torch-source/factories/sm64/geo
+          mkdir -p torch-source/factories/sm64/level
+
+          cp \
+            source/Torch/src/factories/sm64/behavior/BehaviorCommand.h \
+            torch-source/factories/sm64/behavior/
+
+          cp \
+            source/Torch/src/factories/sm64/geo/GeoCommand.h \
+            torch-source/factories/sm64/geo/
+
+          cp \
+            source/Torch/src/factories/sm64/level/LevelCommand.h \
+            torch-source/factories/sm64/level/
+
+          {
+            echo "===== BehaviorCommand.h ====="
+            cat source/Torch/src/factories/sm64/behavior/BehaviorCommand.h
+            echo
+            echo "===== GeoCommand.h ====="
+            cat source/Torch/src/factories/sm64/geo/GeoCommand.h
+            echo
+            echo "===== LevelCommand.h ====="
+            cat source/Torch/src/factories/sm64/level/LevelCommand.h
+          } | tee torch-formatter-source.txt
+
+          find torch-source -type f -print | sort
+
+      - name: Upload Torch source files
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lighthouse-Torch-formatter-source
+          path: |
+            torch-source/
+            torch-formatter-source.txt
+            submodules.txt
+          if-no-files-found: error
+          retention-days: 30
