@@ -1,0 +1,245 @@
+name: Build Lighthouse H700 v12 Original Runtime
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: debian:bookworm
+    timeout-minutes: 300
+
+    steps:
+      - name: Install Bookworm build environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential git ninja-build pkg-config \
+            python3 python3-pip ca-certificates \
+            libsdl2-dev libsdl2-net-dev \
+            libpng-dev libzip-dev libtinyxml2-dev \
+            libogg-dev libvorbis-dev libbz2-dev \
+            libboost-dev nlohmann-json3-dev \
+            libglvnd-dev libgl-dev libgles2-mesa-dev libegl1-mesa-dev \
+            libglew-dev libglfw3-dev \
+            patchelf zip file binutils
+
+          python3 -m pip install --no-cache-dir --break-system-packages "cmake==3.31.6"
+
+          hash -r
+          cmake --version | tee cmake-version.txt
+          gcc --version | tee compiler-version.txt
+
+          cmake_version="$(cmake --version | awk 'NR==1 {print $3}')"
+          python3 - "$cmake_version" <<'PY'
+          import sys
+          version = tuple(int(part) for part in sys.argv[1].split('.')[:3])
+          if version < (3, 26, 0):
+              raise SystemExit(f"CMake is still too old: {sys.argv[1]}")
+          PY
+
+          dpkg-query -W \
+            libsdl2-dev libsdl2-net-dev libzip-dev libtinyxml2-dev \
+            libogg-dev libvorbis-dev \
+            | tee package-versions.txt
+
+      - name: Build static fmt and spdlog
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          FLAGS="-O2 -DNDEBUG -march=armv8-a -mcpu=cortex-a53 -mtune=cortex-a53 -mno-outline-atomics"
+
+          git clone --depth 1 --branch 9.1.0 https://github.com/fmtlib/fmt.git fmt-source
+          cmake -S fmt-source -B fmt-build -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DCMAKE_CXX_FLAGS_RELEASE="$FLAGS" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DFMT_TEST=OFF \
+            -DFMT_DOC=OFF
+          cmake --build fmt-build --parallel "$(nproc)"
+          cmake --install fmt-build
+
+          git clone --depth 1 --branch v1.11.0 \
+            https://github.com/gabime/spdlog.git spdlog-source
+          cmake -S spdlog-source -B spdlog-build -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DCMAKE_PREFIX_PATH=/usr/local \
+            -DCMAKE_CXX_FLAGS_RELEASE="$FLAGS" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DSPDLOG_BUILD_TESTS=OFF \
+            -DSPDLOG_BUILD_EXAMPLE=OFF \
+            -DSPDLOG_BUILD_BENCH=OFF \
+            -DSPDLOG_FMT_EXTERNAL=ON
+          cmake --build spdlog-build --parallel "$(nproc)"
+          cmake --install spdlog-build
+
+          find /usr/local -type f \
+            \( -name 'libfmt.a' -o -name 'libspdlog.a' -o -name '*Config.cmake' \) \
+            -print | sort | tee static-library-files.txt
+
+      - name: Download exact Lighthouse source
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git clone https://github.com/HarbourMasters/Lighthouse.git source
+          cd source
+          git checkout 4423e0c1a10e70c42301bce2a5fb969964cf3537
+          git submodule sync --recursive
+          git submodule update --init --recursive --force
+          git submodule status --recursive | tee ../submodules.txt
+
+      - name: Patch Torch formatter compatibility
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          replacements = {
+              Path("source/Torch/src/factories/sm64/behavior/BehaviorCommand.h"):
+                  "auto format(const BehaviorOpcode& opcode, format_context& ctx) const {",
+              Path("source/Torch/src/factories/sm64/geo/GeoCommand.h"):
+                  "auto format(const GeoOpcode& opcode, format_context& ctx) const {",
+              Path("source/Torch/src/factories/sm64/level/LevelCommand.h"):
+                  "auto format(const LevelOpcode& opcode, format_context& ctx) const {",
+          }
+
+          report = []
+          for path, old in replacements.items():
+              text = path.read_text()
+              new = old.replace(") const {", ") {")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one formatter, found {count}")
+              path.write_text(text.replace(old, new, 1))
+              report.append(f"{path}: patched")
+
+          Path("torch-patches.txt").write_text("\n".join(report) + "\n")
+          PY
+
+          cat torch-patches.txt
+
+      - name: Configure exact-runtime Cortex-A53 build
+        shell: bash
+        run: |
+          set -o pipefail
+
+          export CMAKE_PREFIX_PATH="/usr/local"
+          export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+          cmake -S source -B source/build-h700 -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH=/usr/local \
+            -DOpenGL_GL_PREFERENCE=LEGACY \
+            -DOPENGL_gl_LIBRARY=/usr/lib/aarch64-linux-gnu/libGLESv2.so \
+            -DOPENGL_opengl_LIBRARY=/usr/lib/aarch64-linux-gnu/libGLESv2.so \
+            -DCMAKE_C_FLAGS="-march=armv8-a -mcpu=cortex-a53 -mtune=cortex-a53 -mno-outline-atomics" \
+            -DCMAKE_CXX_FLAGS="-march=armv8-a -mcpu=cortex-a53 -mtune=cortex-a53 -mno-outline-atomics" \
+            -DCMAKE_C_FLAGS_RELEASE="-O2 -DNDEBUG" \
+            -DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG" \
+            -DCMAKE_EXE_LINKER_FLAGS="-Wl,--as-needed" \
+            2>&1 | tee configure.log
+
+      - name: Compile Lighthouse
+        shell: bash
+        run: |
+          set -o pipefail
+
+          cmake --build source/build-h700 --parallel "$(nproc)" 2>&1 | tee build.log
+
+          test -x source/build-h700/Lighthouse
+          file source/build-h700/Lighthouse | tee binary-file.txt
+          readelf -d source/build-h700/Lighthouse | tee binary-needed.txt
+
+          grep -q 'Shared library: \[libGLESv2.so.2\]' binary-needed.txt
+          grep -q 'Shared library: \[libzip.so.5\]' binary-needed.txt
+          grep -q 'Shared library: \[libtinyxml2.so.10\]' binary-needed.txt
+          grep -q 'Shared library: \[libogg.so.0\]' binary-needed.txt
+          grep -q 'Shared library: \[libvorbis.so.0\]' binary-needed.txt
+
+          if grep -q 'Shared library: \[libfmt.so' binary-needed.txt; then
+            echo "ERROR: fmt was dynamically linked"
+            exit 1
+          fi
+
+          if grep -q 'Shared library: \[libspdlog.so' binary-needed.txt; then
+            echo "ERROR: spdlog was dynamically linked"
+            exit 1
+          fi
+
+      - name: Package original-style runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p package/lighthouse/libs
+          install -m 755 source/build-h700/Lighthouse package/lighthouse/Lighthouse
+
+          # Match the original port: system SDL2 and GLES, bundled data libraries.
+          for lib in \
+            /usr/lib/aarch64-linux-gnu/libSDL2_net-2.0.so.0 \
+            /usr/lib/aarch64-linux-gnu/libogg.so.0 \
+            /usr/lib/aarch64-linux-gnu/libvorbis.so.0 \
+            /usr/lib/aarch64-linux-gnu/libvorbisenc.so.2 \
+            /usr/lib/aarch64-linux-gnu/libvorbisfile.so.3 \
+            /usr/lib/aarch64-linux-gnu/libzip.so.5 \
+            /usr/lib/aarch64-linux-gnu/libtinyxml2.so.10 \
+            /usr/lib/aarch64-linux-gnu/libz.so.1; do
+              test -f "$lib"
+              cp -L "$lib" package/lighthouse/libs/
+          done
+
+          patchelf --set-rpath '$ORIGIN/libs' package/lighthouse/Lighthouse
+
+          ldd package/lighthouse/Lighthouse | tee ldd-packaged.txt
+          readelf --version-info package/lighthouse/Lighthouse > elf-versions.txt
+          find package -maxdepth 3 -type f -printf '%p\n' | sort > package-files.txt
+
+          cd package
+          zip -9 -r ../Lighthouse-H700-muOS-v12.zip lighthouse
+
+      - name: Upload finished package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lighthouse-H700-muOS-v12-OriginalRuntime
+          path: Lighthouse-H700-muOS-v12.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lighthouse-H700-v12-diagnostics
+          path: |
+            cmake-version.txt
+            compiler-version.txt
+            package-versions.txt
+            static-library-files.txt
+            submodules.txt
+            torch-patches.txt
+            configure.log
+            build.log
+            binary-file.txt
+            binary-needed.txt
+            ldd-packaged.txt
+            elf-versions.txt
+            package-files.txt
+            source/build-h700/CMakeCache.txt
+            source/build-h700/CMakeFiles/CMakeOutput.log
+            source/build-h700/CMakeFiles/CMakeError.log
+          if-no-files-found: warn
+          retention-days: 30
